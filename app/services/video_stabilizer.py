@@ -370,6 +370,8 @@ class APDVideoStabilizer:
                 person_conf=0.90,
                 checklist=w["checklist"],
                 is_compliant=w["is_compliant"],
+                is_partial=w.get("is_partial", False),
+                status_label=w.get("status_label", None),
                 missing_items=missing,
                 detected_apds=[
                     APDItem(
@@ -637,80 +639,161 @@ class WorkerAnatomicalContainer:
     def _assign_worker_ids(
         self, worker_candidates: List[Dict[str, Any]], frame_idx: int
     ) -> List[Dict[str, Any]]:
-        """Match incoming worker candidates to persistent worker track IDs via spatial proximity."""
-        # Purge stale tracks older than 60 frames
+        """Match incoming worker candidates to persistent worker track IDs via scale-invariant Hungarian matching."""
+        # Purge stale tracks older than 75 frames (bridges momentary worker occlusions)
         self.active_worker_tracks = {
             tid: data for tid, data in self.active_worker_tracks.items()
-            if frame_idx - data["last_frame"] <= 60
+            if frame_idx - data["last_frame"] <= 75
         }
+
+        def get_cand_anchor(cand):
+            if cand["helmet"] is not None:
+                hb = cand["helmet"]["bbox"]
+                return {
+                    "hc": ((hb[0] + hb[2]) / 2.0, (hb[1] + hb[3]) / 2.0),
+                    "hw": max(10.0, hb[2] - hb[0]),
+                    "hh": max(10.0, hb[3] - hb[1]),
+                    "has_helmet": True,
+                }
+            bb = cand["body_box"]
+            bw = max(10.0, bb[2] - bb[0])
+            bh = max(10.0, bb[3] - bb[1])
+            return {
+                "hc": ((bb[0] + bb[2]) / 2.0, bb[1] + bh * 0.20),
+                "hw": bw * 0.40,
+                "hh": bh * 0.25,
+                "has_helmet": False,
+            }
+
+        def get_next_id():
+            used = set(self.active_worker_tracks.keys())
+            cand_id = 1
+            while cand_id in used:
+                cand_id += 1
+            return cand_id
 
         if not self.active_worker_tracks:
             assigned = []
             for cand in worker_candidates:
-                tid = self.next_worker_id
-                self.next_worker_id += 1
+                tid = get_next_id()
                 cand["worker_id"] = tid
                 bb = cand["body_box"]
-                cx = (bb[0] + bb[2]) / 2.0
-                cy = (bb[1] + bb[3]) / 2.0
+                anc = get_cand_anchor(cand)
                 self.active_worker_tracks[tid] = {
-                    "centroid": (cx, cy),
+                    "centroid": ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0),
                     "body_box": list(bb),
+                    "anchor": anc,
                     "last_frame": frame_idx,
                 }
                 assigned.append(cand)
+            assigned.sort(key=lambda x: x["worker_id"])
             return assigned
 
-        active_tids = list(self.active_worker_tracks.keys())
-        matches = []
-        for c_idx, cand in enumerate(worker_candidates):
+        active_tids = sorted(list(self.active_worker_tracks.keys()))
+        n_cands = len(worker_candidates)
+        n_tracks = len(active_tids)
+
+        # Build scale-invariant cost matrix
+        cost_matrix = []
+        for cand in worker_candidates:
+            c_anc = get_cand_anchor(cand)
+            c_hc = c_anc["hc"]
+            c_hw = c_anc["hw"]
             bb = cand["body_box"]
             cx = (bb[0] + bb[2]) / 2.0
             cy = (bb[1] + bb[3]) / 2.0
+
+            row = []
             for tid in active_tids:
                 t_data = self.active_worker_tracks[tid]
+                t_anc = t_data.get("anchor")
+                t_bb = t_data["body_box"]
                 tcx, tcy = t_data["centroid"]
-                t_box = t_data["body_box"]
-                iou = box_iou(bb, t_box)
-                dist = math.hypot(cx - tcx, cy - tcy)
-                diag = max(20.0, math.hypot(bb[2] - bb[0], bb[3] - bb[1]))
-                norm_dist = dist / diag
-                if iou >= 0.15 or norm_dist <= 0.70:
-                    score = iou * 1.5 - norm_dist
-                    matches.append((score, c_idx, tid))
 
-        matches.sort(key=lambda x: x[0], reverse=True)
+                if t_anc is not None:
+                    t_hc = t_anc["hc"]
+                    t_hw = t_anc["hw"]
+                    dist = math.hypot(c_hc[0] - t_hc[0], c_hc[1] - t_hc[1])
+                    ref_scale = max(25.0, c_hw, t_hw)
+                    norm_dist = dist / ref_scale
+                    # Spatial gate: helmet anchor cannot jump > 3.0 helmet widths or > 180px between frames
+                    if norm_dist > 3.0 and dist > 180.0:
+                        cost = 9999.0
+                    else:
+                        cost = norm_dist
+                else:
+                    iou = box_iou(bb, t_bb)
+                    dist = math.hypot(cx - tcx, cy - tcy)
+                    diag = max(20.0, math.hypot(bb[2] - bb[0], bb[3] - bb[1]))
+                    norm_dist = dist / diag
+                    if norm_dist > 0.85 and iou < 0.10:
+                        cost = 9999.0
+                    else:
+                        cost = norm_dist + (1.0 - iou) * 1.5
+
+                row.append(cost)
+            cost_matrix.append(row)
+
+        # Global optimal bipartite matching (guarantees minimum global distance, eliminating label flips)
+        import itertools
+        best_pairs = []
+        if n_cands > 0 and n_tracks > 0:
+            if n_cands <= n_tracks:
+                best_cost = float("inf")
+                best_p = None
+                for p in itertools.permutations(range(n_tracks), n_cands):
+                    c = sum(cost_matrix[i][p[i]] for i in range(n_cands))
+                    if c < best_cost:
+                        best_cost = c
+                        best_p = p
+                if best_p is not None:
+                    for i in range(n_cands):
+                        if cost_matrix[i][best_p[i]] < 4.0:
+                            best_pairs.append((i, best_p[i]))
+            else:
+                best_cost = float("inf")
+                best_p = None
+                for p in itertools.permutations(range(n_cands), n_tracks):
+                    c = sum(cost_matrix[p[j]][j] for j in range(n_tracks))
+                    if c < best_cost:
+                        best_cost = c
+                        best_p = p
+                if best_p is not None:
+                    for j in range(n_tracks):
+                        if cost_matrix[best_p[j]][j] < 4.0:
+                            best_pairs.append((best_p[j], j))
+
         assigned_c_idxs = set()
         assigned_tids = set()
         assigned = []
 
-        for score, c_idx, tid in matches:
-            if c_idx not in assigned_c_idxs and tid not in assigned_tids:
-                cand = worker_candidates[c_idx]
-                cand["worker_id"] = tid
-                bb = cand["body_box"]
-                cx = (bb[0] + bb[2]) / 2.0
-                cy = (bb[1] + bb[3]) / 2.0
-                self.active_worker_tracks[tid] = {
-                    "centroid": (cx, cy),
-                    "body_box": list(bb),
-                    "last_frame": frame_idx,
-                }
-                assigned_c_idxs.add(c_idx)
-                assigned_tids.add(tid)
-                assigned.append(cand)
+        for c_idx, t_idx in best_pairs:
+            tid = active_tids[t_idx]
+            cand = worker_candidates[c_idx]
+            cand["worker_id"] = tid
+            bb = cand["body_box"]
+            anc = get_cand_anchor(cand)
+            self.active_worker_tracks[tid] = {
+                "centroid": ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0),
+                "body_box": list(bb),
+                "anchor": anc,
+                "last_frame": frame_idx,
+            }
+            assigned_c_idxs.add(c_idx)
+            assigned_tids.add(tid)
+            assigned.append(cand)
 
+        # Handle genuinely new unmatched candidates by assigning lowest unused integer ID
         for c_idx, cand in enumerate(worker_candidates):
             if c_idx not in assigned_c_idxs:
-                tid = self.next_worker_id
-                self.next_worker_id += 1
+                tid = get_next_id()
                 cand["worker_id"] = tid
                 bb = cand["body_box"]
-                cx = (bb[0] + bb[2]) / 2.0
-                cy = (bb[1] + bb[3]) / 2.0
+                anc = get_cand_anchor(cand)
                 self.active_worker_tracks[tid] = {
-                    "centroid": (cx, cy),
+                    "centroid": ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0),
                     "body_box": list(bb),
+                    "anchor": anc,
                     "last_frame": frame_idx,
                 }
                 assigned.append(cand)
@@ -900,10 +983,13 @@ class WorkerAnatomicalContainer:
                             continue
 
                     elif cname == "glove":
-                        # Gloves cannot be above the helmet dome or miles away horizontally
-                        if acy < hb[1] + hh * 0.35:
+                        # Human arm reach: gloves can reach forward, up, down, or sideways
+                        # In high-angle / overhead CCTV, forward reach is projected higher up (lower Y) in 2D image
+                        arm_reach = max(hw * 2.5, 120.0)
+                        dist_to_helmet = math.hypot(acx - hcx, acy - hcy)
+                        if dist_to_helmet > arm_reach * 1.8:
                             continue
-                        if abs(acx - hcx) > max(hw * 2.2, 85.0):
+                        if abs(acx - hcx) > max(hw * 2.4, 95.0):
                             continue
 
                 # Proximity inside worker's reach zone
@@ -1049,18 +1135,26 @@ class WorkerAnatomicalContainer:
             if has_sepatu: mem["sepatu"] = frame_idx
 
             # Context-Aware Industrial Compliance Logic:
-            # Do NOT unfairly punish workers whose body parts are occluded or out-of-frame!
+            # 1. Helm: Mandatory on rig
+            # 2. Glove: MANDATORY on visible hands! NEVER excused by feet being out of frame!
+            # 3. Sepatu: Mandatory IF feet are in frame. If feet are out of camera frame, exempt from penalty.
+            # 4. Kacamata: Accommodates looking down / helmet brim occlusion.
             comp_helm = (frame_idx - mem.get("helm", -999)) <= 180
             comp_glove = (frame_idx - mem.get("glove", -999)) <= 150
             comp_sepatu = ((frame_idx - mem.get("sepatu", -999)) <= 300) or is_feet_out_of_frame
-            # Kacamata: if helmet is worn and head is angled downwards (or during work operations),
-            # safety glasses are physically obscured by helmet brim. Do not penalize if helm is on!
             comp_kacamata = ((frame_idx - mem.get("kacamata", -999)) <= 180) or comp_helm
 
-            # Overall compliance: Helm is mandatory, shoes mandatory (if feet visible), gloves mandatory
-            is_compliant = comp_helm and comp_sepatu and (comp_glove or is_feet_out_of_frame)
+            # Strict verification: Gloves are ALWAYS checked!
+            is_compliant = comp_helm and comp_glove and comp_sepatu
 
+            w["is_feet_out_of_frame"] = is_feet_out_of_frame
+            w["is_partial"] = is_feet_out_of_frame
             w["is_compliant"] = is_compliant
+            if is_compliant:
+                w["status_label"] = "PARSIAL (PATUH)" if is_feet_out_of_frame else "LENGKAP (100%)"
+            else:
+                w["status_label"] = "MELANGGAR"
+
             w["checklist"] = {
                 "helm": comp_helm,
                 "kacamata": comp_kacamata,

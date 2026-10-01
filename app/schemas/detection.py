@@ -40,9 +40,12 @@ class WorkerDetection(BaseModel):
         ...,
         description="Compliance status per APD class: {'helm': bool, 'glove': bool, 'kacamata': bool, 'sepatu': bool}"
     )
-    is_compliant: bool = Field(..., description="True if all 4 required APD items are worn")
+    is_compliant: bool = Field(..., description="True if required APD items are worn")
+    is_partial: bool = Field(default=False, description="True if worker is partially visible (e.g. feet out of camera frame)")
+    status_label: Optional[str] = Field(default=None, description="Status label e.g. LENGKAP (100%), PARSIAL (PATUH), or MELANGGAR")
     missing_items: List[str] = Field(default_factory=list, description="List of APD items not worn")
     detected_apds: List[APDItem] = Field(default_factory=list)
+
 
 
 class ImageDetectionResponse(BaseModel):

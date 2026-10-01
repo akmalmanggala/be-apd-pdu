@@ -610,7 +610,10 @@ class APDDetectorEngine:
 
                 if worker.is_compliant:
                     box_color = (0, 230, 0)  # Vivid Green for Compliant
-                    status_text = f"Pekerja #{worker.track_id}: LENGKAP (100%)"
+                    if getattr(worker, "is_partial", False):
+                        status_text = f"Pekerja #{worker.track_id}: PARSIAL (PATUH)"
+                    else:
+                        status_text = f"Pekerja #{worker.track_id}: LENGKAP (100%)"
                 else:
                     box_color = (0, 0, 230)  # Red for Violation
                     missing_str = ", ".join(m.capitalize() for m in worker.missing_items)
