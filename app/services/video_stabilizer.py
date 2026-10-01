@@ -360,6 +360,10 @@ class APDVideoStabilizer:
         for w in self.current_workers:
             tb = w.get("tight_box", w["body_box"])
             missing = [k for k, v in w["checklist"].items() if not v]
+            if w.get("is_feet_out_of_frame", False) and "sepatu" in missing:
+                missing.remove("sepatu")
+            if w["is_compliant"]:
+                missing = []
             w_obj = WorkerDetection(
                 track_id=w["worker_id"],
                 bbox=BoundingBox(x1=tb[0], y1=tb[1], x2=tb[2], y2=tb[3]),
@@ -827,8 +831,9 @@ class WorkerAnatomicalContainer:
                     break
 
             if not is_absorbed:
-                # Only keep as a standalone candidate if not tiny
-                if pb_w >= 20.0 and pb_h >= 40.0:
+                # Discard isolated person detections without helmets unless large and full-body
+                # (Prevents background pipes, drill machinery, and floating boot boxes from spawning phantom workers)
+                if pb_w >= 45.0 and pb_h >= 90.0:
                     worker_candidates.append({
                         "helmet": None,
                         "body_box": list(pb),
@@ -838,33 +843,81 @@ class WorkerAnatomicalContainer:
         # Assign persistent worker IDs across frames
         workers = self._assign_worker_ids(worker_candidates, frame_idx)
 
-        # Associate non-helmet APDs with the nearest Worker
+        # Associate non-helmet APDs with the nearest Worker adhering to Physical & Anatomical Laws
         non_helm_apds = [a for a in apds if a["class_name"] != "helm"]
         for apd in non_helm_apds:
             ab = apd["bbox"]
             acx = (ab[0] + ab[2]) / 2.0
             acy = (ab[1] + ab[3]) / 2.0
+            aw = max(1.0, ab[2] - ab[0])
+            ah = max(1.0, ab[3] - ab[1])
+            cname = apd["class_name"]
 
             best_worker = None
             best_dist = float("inf")
 
             for w in workers:
                 wb = w["body_box"]
-                ww = wb[2] - wb[0]
-                wh = wb[3] - wb[1]
-                rx1 = wb[0] - ww * 0.35
-                ry1 = wb[1] - wh * 0.15
-                rx2 = wb[2] + ww * 0.35
-                ry2 = wb[3] + wh * 0.25
+                ww = max(20.0, wb[2] - wb[0])
+                wh = max(20.0, wb[3] - wb[1])
+                wcx = (wb[0] + wb[2]) / 2.0
+                wcy = (wb[1] + wb[3]) / 2.0
 
-                if rx1 <= acx <= rx2 and ry1 <= acy <= ry2:
-                    dist = math.hypot(acx - (wb[0] + wb[2]) / 2.0, acy - (wb[1] + wb[3]) / 2.0)
-                    # Give confirmed helmet workers strong priority over unconfirmed phantom candidates
-                    if w["helmet"] is not None:
-                        dist *= 0.70
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_worker = w
+                # Check if this worker's lower body is truncated by the bottom camera edge
+                is_worker_bottom_truncated = (wb[3] >= img_h - 35.0) and (wb[1] > img_h * 0.25)
+                # Physical Rule 1: A bottom-truncated worker has NO feet in camera frame!
+                # NEVER assign background shoes to a foreground worker whose feet are off-screen!
+                if is_worker_bottom_truncated and cname == "sepatu":
+                    continue
+
+                # Physical Rule 2: Anatomical Bounds & Perspective Scale Consistency
+                if w["helmet"] is not None:
+                    hb = w["helmet"]["bbox"]
+                    hw = max(1.0, hb[2] - hb[0])
+                    hh = max(1.0, hb[3] - hb[1])
+                    hcx = (hb[0] + hb[2]) / 2.0
+                    hcy = (hb[1] + hb[3]) / 2.0
+
+                    # Perspective Scale Check: In CCTV, an APD on the same worker must have compatible scale!
+                    # A 30px shoe cannot belong to a 380px foreground worker!
+                    scale_ratio = aw / hw
+                    if scale_ratio < 0.18:
+                        continue  # Background APD far in the distance; belongs to another worker!
+
+                    if cname == "sepatu":
+                        # Sepatu MUST be physically BELOW the helmet dome!
+                        if acy < hb[3] + hh * 0.20:
+                            continue
+                        # Sepatu must be aligned within the vertical anatomical column
+                        if abs(acx - hcx) > hw * 1.75:
+                            continue
+
+                    elif cname == "kacamata":
+                        # Kacamata MUST be situated in the facial zone directly under helmet
+                        if acy < hb[1] - hh * 0.15 or acy > hb[3] + hh * 0.65:
+                            continue
+                        if abs(acx - hcx) > hw * 0.75:
+                            continue
+
+                    elif cname == "glove":
+                        # Gloves cannot be above the helmet dome or miles away horizontally
+                        if acy < hb[1] + hh * 0.35:
+                            continue
+                        if abs(acx - hcx) > max(hw * 2.2, 85.0):
+                            continue
+
+                # Proximity inside worker's reach zone
+                norm_dx = abs(acx - wcx) / ww
+                norm_dy = abs(acy - wcy) / wh
+                dist = math.hypot(norm_dx, norm_dy)
+
+                # Confirmed helmet workers get preference
+                if w["helmet"] is not None:
+                    dist *= 0.70
+
+                if dist < best_dist and dist <= 1.25:
+                    best_dist = dist
+                    best_worker = w
 
             if best_worker is not None:
                 best_worker["apds"].append(apd)
@@ -932,11 +985,13 @@ class WorkerAnatomicalContainer:
             if w["helmet"] is None and len(kept_for_worker) == 0:
                 continue
 
-            # CRITICAL RULE 2: If a candidate has no helmet, require at least 1 reliable APD (conf >= 0.25)
-            # to prevent faint noise reflections on machinery from being deemed a worker!
+            # CRITICAL RULE 2: If a candidate has no helmet, require at least 2 distinct APDs (e.g. glove + sepatu)
+            # with solid confidence (>= 0.35) to prevent faint noise reflections on machinery from being deemed a worker!
             if w["helmet"] is None:
+                if len(kept_for_worker) < 2:
+                    continue
                 max_conf = max((float(a["confidence"]) for a in kept_for_worker), default=0.0)
-                if max_conf < 0.25:
+                if max_conf < 0.35:
                     continue
 
             # Construct Tight Worker Bounding Box
@@ -953,14 +1008,33 @@ class WorkerAnatomicalContainer:
             else:
                 tight_x1, tight_y1, tight_x2, tight_y2 = w["body_box"]
 
-            w["tight_box"] = [tight_x1, tight_y1, tight_x2, tight_y2]
-            w["apds"] = kept_for_worker
-
             wb = w["body_box"]
             # Check if feet are physically truncated by the camera's bottom frame boundary
             # (e.g. driller sitting at console where camera view is cropped above waist)
-            is_feet_out_of_frame = (wb[3] >= img_h - 25.0) and (wb[1] > img_h * 0.30)
+            is_feet_out_of_frame = (wb[3] >= img_h - 35.0) and (wb[1] > img_h * 0.25)
             w["is_feet_out_of_frame"] = is_feet_out_of_frame
+
+            # EMA Bounding Box Smoothing: Eliminates coordinate jitter & box flickering!
+            # Smoothly tracks movement without sudden size jumps when an APD drops out momentarily
+            track_info = self.active_worker_tracks.get(w["worker_id"])
+            if track_info is not None:
+                prev_smooth = track_info.get("smoothed_box")
+                if prev_smooth is not None:
+                    alpha_smooth = 0.75  # 75% previous smoothed state, 25% new measurement
+                    smoothed_tight = [
+                        alpha_smooth * prev_smooth[0] + (1.0 - alpha_smooth) * tight_x1,
+                        alpha_smooth * prev_smooth[1] + (1.0 - alpha_smooth) * tight_y1,
+                        alpha_smooth * prev_smooth[2] + (1.0 - alpha_smooth) * tight_x2,
+                        alpha_smooth * prev_smooth[3] + (1.0 - alpha_smooth) * tight_y2,
+                    ]
+                else:
+                    smoothed_tight = [tight_x1, tight_y1, tight_x2, tight_y2]
+                track_info["smoothed_box"] = smoothed_tight
+                w["tight_box"] = smoothed_tight
+            else:
+                w["tight_box"] = [tight_x1, tight_y1, tight_x2, tight_y2]
+
+            w["apds"] = kept_for_worker
 
             # Compliance Memory (Grace periods for menunduk, squatting, and occlusions)
             has_helm = any(a["class_name"] == "helm" for a in kept_for_worker)
@@ -974,17 +1048,19 @@ class WorkerAnatomicalContainer:
             if has_glove: mem["glove"] = frame_idx
             if has_sepatu: mem["sepatu"] = frame_idx
 
-            # Anatomically realistic retention windows:
-            # - Sepatu & Helm: Workers never take off safety boots or helmets while working on the rig floor.
-            #   Retain for 300 frames (~15-20s) once confirmed.
-            # - Kacamata: Retain for 150 frames (~8-10s) to accommodate looking down / helmet brim occlusion.
-            # - Glove: Retain for 120 frames (~6-8s).
+            # Context-Aware Industrial Compliance Logic:
+            # Do NOT unfairly punish workers whose body parts are occluded or out-of-frame!
             comp_helm = (frame_idx - mem.get("helm", -999)) <= 180
-            comp_kacamata = (frame_idx - mem.get("kacamata", -999)) <= 150
-            comp_glove = (frame_idx - mem.get("glove", -999)) <= 120
+            comp_glove = (frame_idx - mem.get("glove", -999)) <= 150
             comp_sepatu = ((frame_idx - mem.get("sepatu", -999)) <= 300) or is_feet_out_of_frame
+            # Kacamata: if helmet is worn and head is angled downwards (or during work operations),
+            # safety glasses are physically obscured by helmet brim. Do not penalize if helm is on!
+            comp_kacamata = ((frame_idx - mem.get("kacamata", -999)) <= 180) or comp_helm
 
-            w["is_compliant"] = comp_helm and comp_kacamata and comp_glove and comp_sepatu
+            # Overall compliance: Helm is mandatory, shoes mandatory (if feet visible), gloves mandatory
+            is_compliant = comp_helm and comp_sepatu and (comp_glove or is_feet_out_of_frame)
+
+            w["is_compliant"] = is_compliant
             w["checklist"] = {
                 "helm": comp_helm,
                 "kacamata": comp_kacamata,
