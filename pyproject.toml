@@ -1,0 +1,25 @@
+[project]
+name = "be-apd-pdu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "bcrypt>=5.0.0",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "opencv-python>=5.0.0.93",
+    "passlib[bcrypt]>=1.7.4",
+    "pillow>=12.3.0",
+    "pydantic>=2.13.5",
+    "pyjwt>=2.14.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "python-multipart>=0.0.32",
+    "sqlalchemy>=2.0.54",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "ultralytics>=8.4.123",
+    "uvicorn[standard]>=0.53.0",
+]
